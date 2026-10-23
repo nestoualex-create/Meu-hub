@@ -1,0 +1,622 @@
+--[[
+    PAINEL DE CONTROLE - FLY + ESP
+    Compatível com executores móveis (Delta, etc.)
+    LocalScript para StarterPlayerScripts ou execução via executor.
+    
+    Funcionalidades:
+    - GUI arrastável com minimizar/fechar
+    - Fly com controle por analógico (mobile) e teclado (PC)
+    - ESP com Box, Nome, Vida e Distância
+    - Persistência de estado (via arquivo local do executor)
+]]
+
+-- ============================================
+-- SERVIÇOS
+-- ============================================
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local TweenService = game:GetService("TweenService")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+-- ============================================
+-- CONFIGURAÇÕES
+-- ============================================
+local CONFIG = {
+    FlySpeed = 50,
+    FlySpeedMin = 20,
+    FlySpeedMax = 200,
+    ESPMaxDistance = 500,
+    BoxColor = Color3.fromRGB(255, 255, 255),
+    HealthColor = Color3.fromRGB(0, 255, 0),
+    TextColor = Color3.fromRGB(255, 255, 255),
+    TextOutline = Color3.fromRGB(0, 0, 0),
+}
+
+-- ============================================
+-- ESTADO
+-- ============================================
+local State = {
+    FlyEnabled = false,
+    ESPEnabled = false,
+    MenuOpen = true,
+    FlySpeed = CONFIG.FlySpeed,
+    Connections = {},
+}
+
+-- Objetos de física do Fly
+local FlyObjects = {
+    BodyVelocity = nil,
+    BodyGyro = nil,
+}
+
+-- Tabela de ESP por jogador
+local ESPCache = {}
+
+-- Referências da GUI
+local GUI = {
+    ScreenGui = nil,
+    MainFrame = nil,
+    FlyButton = nil,
+    ESPButton = nil,
+    SpeedLabel = nil,
+}
+
+-- ============================================
+-- PERSISTÊNCIA (tenta carregar/salvar)
+-- ============================================
+local function loadSettings()
+    local ok, result = pcall(function()
+        if readfile and isfile and isfile("painel_config.json") then
+            local data = readfile("painel_config.json")
+            local decoded = game:GetService("HttpService"):JSONDecode(data)
+            if decoded.FlySpeed then State.FlySpeed = decoded.FlySpeed end
+            -- Não restaura Fly/ESP automaticamente por segurança; apenas a velocidade
+        end
+    end)
+    if not ok then
+        warn("[Painel] Não foi possível carregar configurações: " .. tostring(result))
+    end
+end
+
+local function saveSettings()
+    local ok, result = pcall(function()
+        if writefile then
+            local data = game:GetService("HttpService"):JSONEncode({
+                FlySpeed = State.FlySpeed,
+            })
+            writefile("painel_config.json", data)
+        end
+    end)
+    if not ok then
+        warn("[Painel] Não foi possível salvar configurações: " .. tostring(result))
+    end
+end
+
+loadSettings()
+
+-- ============================================
+-- UTILITÁRIOS
+-- ============================================
+local function getCharacter()
+    local char = LocalPlayer.Character
+    if not char then return nil end
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    local root = char:FindFirstChild("HumanoidRootPart")
+    if not humanoid or not root then return nil end
+    return char, humanoid, root
+end
+
+local function disconnectAll()
+    for _, conn in ipairs(State.Connections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    State.Connections = {}
+end
+
+-- ============================================
+-- SISTEMA FLY
+-- ============================================
+local function stopFly()
+    -- Remove objetos de física
+    if FlyObjects.BodyVelocity then
+        FlyObjects.BodyVelocity:Destroy()
+        FlyObjects.BodyVelocity = nil
+    end
+    if FlyObjects.BodyGyro then
+        FlyObjects.BodyGyro:Destroy()
+        FlyObjects.BodyGyro = nil
+    end
+    
+    -- Restaura o estado do Humanoid
+    local _, humanoid = getCharacter()
+    if humanoid then
+        humanoid.PlatformStand = false
+    end
+    
+    State.FlyEnabled = false
+    if GUI.FlyButton then
+        GUI.FlyButton.Text = "Fly: OFF"
+        GUI.FlyButton.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+    end
+end
+
+local function startFly()
+    local char, humanoid, root = getCharacter()
+    if not char or not humanoid or not root then
+        warn("[Painel] Personagem não encontrado para ativar Fly.")
+        return
+    end
+    
+    -- Cria BodyVelocity e BodyGyro para voo suave
+    local bodyVel = Instance.new("BodyVelocity")
+    bodyVel.Name = "FlyBodyVelocity"
+    bodyVel.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+    bodyVel.Velocity = Vector3.zero
+    bodyVel.Parent = root
+    
+    local bodyGyro = Instance.new("BodyGyro")
+    bodyGyro.Name = "FlyBodyGyro"
+    bodyGyro.MaxTorque = Vector3.new(1e5, 1e5, 1e5)
+    bodyGyro.P = 1000
+    bodyGyro.D = 50
+    bodyGyro.CFrame = root.CFrame
+    bodyGyro.Parent = root
+    
+    FlyObjects.BodyVelocity = bodyVel
+    FlyObjects.BodyGyro = bodyGyro
+    
+    humanoid.PlatformStand = true
+    
+    State.FlyEnabled = true
+    if GUI.FlyButton then
+        GUI.FlyButton.Text = "Fly: ON"
+        GUI.FlyButton.BackgroundColor3 = Color3.fromRGB(46, 204, 113)
+    end
+end
+
+local function toggleFly()
+    if State.FlyEnabled then
+        stopFly()
+    else
+        startFly()
+    end
+    saveSettings()
+end
+
+-- Loop de atualização do voo (RenderStepped)
+local function updateFly()
+    if not State.FlyEnabled then return end
+    
+    local char, humanoid, root = getCharacter()
+    if not char or not humanoid or not root then
+        stopFly()
+        return
+    end
+    
+    local bodyVel = FlyObjects.BodyVelocity
+    local bodyGyro = FlyObjects.BodyGyro
+    if not bodyVel or not bodyGyro then return end
+    
+    -- Pega direção do movimento (funciona com analógico mobile e WASD)
+    local moveDir = humanoid.MoveDirection
+    local camCFrame = Camera.CFrame
+    
+    -- Direção horizontal baseada na câmera
+    local forward = camCFrame.LookVector
+    local right = camCFrame.RightVector
+    
+    local moveVector = (forward * moveDir.Z + right * moveDir.X)
+    if moveVector.Magnitude > 0 then
+        moveVector = moveVector.Unit
+    end
+    
+    -- Controle vertical: usa o analógico direito (ou teclas Space/Ctrl no PC)
+    local vertical = 0
+    if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+        vertical = 1
+    elseif UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+        vertical = -1
+    end
+    
+    -- No mobile, o analógico direito controla a câmera; para subir/descer,
+    -- podemos usar a inclinação da câmera ou um botão extra. Aqui usamos
+    -- a direção Y da câmera como fallback (olhar para cima sobe).
+    if vertical == 0 and UserInputService.TouchEnabled then
+        -- Se o jogador estiver olhando para cima, sobe suavemente
+        local lookY = camCFrame.LookVector.Y
+        if lookY > 0.3 then vertical = 1
+        elseif lookY < -0.3 then vertical = -1 end
+    end
+    
+    local velocity = (moveVector * State.FlySpeed) + Vector3.new(0, vertical * State.FlySpeed * 0.8, 0)
+    bodyVel.Velocity = velocity
+    
+    -- Mantém orientação estável
+    bodyGyro.CFrame = CFrame.new(root.Position, root.Position + camCFrame.LookVector)
+end
+
+-- ============================================
+-- SISTEMA ESP
+-- ============================================
+local function createESP(player)
+    if player == LocalPlayer then return nil end
+    
+    local esp = {
+        Box = Drawing.new("Square"),
+        Name = Drawing.new("Text"),
+        HealthBar = Drawing.new("Square"),
+        HealthBarBg = Drawing.new("Square"),
+        Distance = Drawing.new("Text"),
+    }
+    
+    -- Configuração inicial
+    esp.Box.Visible = false
+    esp.Box.Color = CONFIG.BoxColor
+    esp.Box.Thickness = 1
+    esp.Box.Filled = false
+    esp.Box.Transparency = 1
+    
+    esp.Name.Visible = false
+    esp.Name.Color = CONFIG.TextColor
+    esp.Name.Size = 14
+    esp.Name.Center = true
+    esp.Name.Outline = true
+    esp.Name.OutlineColor = CONFIG.TextOutline
+    
+    esp.HealthBarBg.Visible = false
+    esp.HealthBarBg.Color = Color3.fromRGB(30, 30, 30)
+    esp.HealthBarBg.Filled = true
+    esp.HealthBarBg.Transparency = 0.7
+    
+    esp.HealthBar.Visible = false
+    esp.HealthBar.Color = CONFIG.HealthColor
+    esp.HealthBar.Filled = true
+    esp.HealthBar.Transparency = 0.2
+    
+    esp.Distance.Visible = false
+    esp.Distance.Color = CONFIG.TextColor
+    esp.Distance.Size = 12
+    esp.Distance.Center = true
+    esp.Distance.Outline = true
+    esp.Distance.OutlineColor = CONFIG.TextOutline
+    
+    ESPCache[player] = esp
+    return esp
+end
+
+local function clearESP()
+    for player, esp in pairs(ESPCache) do
+        for _, obj in pairs(esp) do
+            pcall(function() obj:Remove() end)
+        end
+    end
+    ESPCache = {}
+end
+
+local function updateESP()
+    if not State.ESPEnabled then
+        -- Esconde todos se desativado
+        for _, esp in pairs(ESPCache) do
+            for _, obj in pairs(esp) do
+                obj.Visible = false
+            end
+        end
+        return
+    end
+    
+    local localChar, _, localRoot = getCharacter()
+    if not localRoot then return end
+    
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player == LocalPlayer then continue end
+        
+        local esp = ESPCache[player]
+        if not esp then
+            esp = createESP(player)
+        end
+        
+        if not esp then continue end
+        
+        local char = player.Character
+        local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        
+        if not char or not humanoid or not root or humanoid.Health <= 0 then
+            -- Esconde ESP se jogador morto ou sem personagem
+            for _, obj in pairs(esp) do
+                obj.Visible = false
+            end
+            continue
+        end
+        
+        local distance = (root.Position - localRoot.Position).Magnitude
+        if distance > CONFIG.ESPMaxDistance then
+            for _, obj in pairs(esp) do
+                obj.Visible = false
+            end
+            continue
+        end
+        
+        -- Converte posição 3D para 2D
+        local screenPos, onScreen = Camera:WorldToViewportPoint(root.Position)
+        if not onScreen then
+            for _, obj in pairs(esp) do
+                obj.Visible = false
+            end
+            continue
+        end
+        
+        -- Calcula tamanho da caixa baseado na distância
+        local headPos = Camera:WorldToViewportPoint(root.Position + Vector3.new(0, 2, 0))
+        local feetPos = Camera:WorldToViewportPoint(root.Position - Vector3.new(0, 2, 0))
+        local boxHeight = math.abs(headPos.Y - feetPos.Y)
+        local boxWidth = boxHeight * 0.6
+        
+        local boxX = screenPos.X - boxWidth / 2
+        local boxY = screenPos.Y - boxHeight / 2
+        
+        -- Atualiza Box
+        esp.Box.Visible = true
+        esp.Box.Position = Vector2.new(boxX, boxY)
+        esp.Box.Size = Vector2.new(boxWidth, boxHeight)
+        
+        -- Atualiza Nome
+        esp.Name.Visible = true
+        esp.Name.Text = player.Name
+        esp.Name.Position = Vector2.new(screenPos.X, boxY - 20)
+        
+        -- Atualiza Barra de Vida (verde, proporcional)
+        local healthPercent = math.clamp(humanoid.Health / humanoid.MaxHealth, 0, 1)
+        local barWidth = boxWidth
+        local barHeight = 4
+        local barY = boxY - 8
+        
+        esp.HealthBarBg.Visible = true
+        esp.HealthBarBg.Position = Vector2.new(boxX, barY)
+        esp.HealthBarBg.Size = Vector2.new(barWidth, barHeight)
+        
+        esp.HealthBar.Visible = true
+        esp.HealthBar.Position = Vector2.new(boxX, barY)
+        esp.HealthBar.Size = Vector2.new(barWidth * healthPercent, barHeight)
+        esp.HealthBar.Color = Color3.fromRGB(
+            math.floor(255 * (1 - healthPercent)),
+            math.floor(255 * healthPercent),
+            0
+        )
+        
+        -- Atualiza Distância
+        esp.Distance.Visible = true
+        esp.Distance.Text = math.floor(distance) .. "m"
+        esp.Distance.Position = Vector2.new(screenPos.X, boxY + boxHeight + 5)
+    end
+end
+
+local function toggleESP()
+    State.ESPEnabled = not State.ESPEnabled
+    
+    if GUI.ESPButton then
+        GUI.ESPButton.Text = "ESP: " .. (State.ESPEnabled and "ON" or "OFF")
+        GUI.ESPButton.BackgroundColor3 = State.ESPEnabled 
+            and Color3.fromRGB(46, 204, 113) 
+            or Color3.fromRGB(45, 45, 55)
+    end
+    
+    if State.ESPEnabled then
+        -- Cria ESP para jogadores existentes
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                createESP(player)
+            end
+        end
+    else
+        clearESP()
+    end
+    
+    saveSettings()
+end
+
+-- ============================================
+-- CRIAÇÃO DA GUI
+-- ============================================
+local function createGUI()
+    -- Remove GUI anterior se existir
+    local oldGui = LocalPlayer.PlayerGui:FindFirstChild("PainelControle")
+    if oldGui then oldGui:Destroy() end
+    
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "PainelControle"
+    screenGui.ResetOnSpawn = false
+    screenGui.IgnoreGuiInset = true
+    screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    screenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+    GUI.ScreenGui = screenGui
+    
+    -- Frame principal (arrastável)
+    local mainFrame = Instance.new("Frame")
+    mainFrame.Name = "MainFrame"
+    mainFrame.Size = UDim2.new(0, 260, 0, 280)
+    mainFrame.Position = UDim2.new(0.5, -130, 0.3, 0)
+    mainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+    mainFrame.BackgroundTransparency = 0.15
+    mainFrame.BorderSizePixel = 0
+    mainFrame.Active = true
+    mainFrame.Draggable = true
+    mainFrame.ClipsDescendants = true
+    mainFrame.Parent = screenGui
+    GUI.MainFrame = mainFrame
+    
+    -- Bordas arredondadas
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 10)
+    corner.Parent = mainFrame
+    
+    -- Contorno sutil
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(60, 60, 75)
+    stroke.Thickness = 1.5
+    stroke.Transparency = 0.5
+    stroke.Parent = mainFrame
+    
+    -- Título
+    local title = Instance.new("TextLabel")
+    title.Name = "Title"
+    title.Size = UDim2.new(1, -60, 0, 35)
+    title.Position = UDim2.new(0, 15, 0, 0)
+    title.BackgroundTransparency = 1
+    title.Text = "Painel de Controle"
+    title.TextColor3 = Color3.fromRGB(220, 220, 230)
+    title.TextSize = 16
+    title.Font = Enum.Font.GothamBold
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = mainFrame
+    
+    -- Botão Fechar (X)
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Name = "CloseButton"
+    closeBtn.Size = UDim2.new(0, 28, 0, 28)
+    closeBtn.Position = UDim2.new(1, -38, 0, 5)
+    closeBtn.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+    closeBtn.Text = "×"
+    closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    closeBtn.TextSize = 20
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.BorderSizePixel = 0
+    closeBtn.Parent = mainFrame
+    
+    local closeCorner = Instance.new("UICorner")
+    closeCorner.CornerRadius = UDim.new(0, 6)
+    closeCorner.Parent = closeBtn
+    
+    -- Botão Minimizar (_)
+    local minBtn = Instance.new("TextButton")
+    minBtn.Name = "MinButton"
+    minBtn.Size = UDim2.new(0, 28, 0, 28)
+    minBtn.Position = UDim2.new(1, -70, 0, 5)
+    minBtn.BackgroundColor3 = Color3.fromRGB(80, 80, 100)
+    minBtn.Text = "−"
+    minBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    minBtn.TextSize = 18
+    minBtn.Font = Enum.Font.GothamBold
+    minBtn.BorderSizePixel = 0
+    minBtn.Parent = mainFrame
+    
+    local minCorner = Instance.new("UICorner")
+    minCorner.CornerRadius = UDim.new(0, 6)
+    minCorner.Parent = minBtn
+    
+    -- Conteúdo (para esconder ao minimizar)
+    local content = Instance.new("Frame")
+    content.Name = "Content"
+    content.Size = UDim2.new(1, -20, 1, -45)
+    content.Position = UDim2.new(0, 10, 0, 40)
+    content.BackgroundTransparency = 1
+    content.Parent = mainFrame
+    
+    -- Botão Fly (Toggle)
+    local flyBtn = Instance.new("TextButton")
+    flyBtn.Name = "FlyButton"
+    flyBtn.Size = UDim2.new(1, 0, 0, 40)
+    flyBtn.Position = UDim2.new(0, 0, 0, 0)
+    flyBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+    flyBtn.Text = "Fly: OFF"
+    flyBtn.TextColor3 = Color3.fromRGB(220, 220, 230)
+    flyBtn.TextSize = 15
+    flyBtn.Font = Enum.Font.GothamMedium
+    flyBtn.BorderSizePixel = 0
+    flyBtn.Parent = content
+    GUI.FlyButton = flyBtn
+    
+    local flyCorner = Instance.new("UICorner")
+    flyCorner.CornerRadius = UDim.new(0, 8)
+    flyCorner.Parent = flyBtn
+    
+    -- Botão ESP (Toggle)
+    local espBtn = Instance.new("TextButton")
+    espBtn.Name = "ESPButton"
+    espBtn.Size = UDim2.new(1, 0, 0, 40)
+    espBtn.Position = UDim2.new(0, 0, 0, 50)
+    espBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+    espBtn.Text = "ESP: OFF"
+    espBtn.TextColor3 = Color3.fromRGB(220, 220, 230)
+    espBtn.TextSize = 15
+    espBtn.Font = Enum.Font.GothamMedium
+    espBtn.BorderSizePixel = 0
+    espBtn.Parent = content
+    GUI.ESPButton = espBtn
+    
+    local espCorner = Instance.new("UICorner")
+    espCorner.CornerRadius = UDim.new(0, 8)
+    espCorner.Parent = espBtn
+    
+    -- Label de Velocidade
+    local speedLabel = Instance.new("TextLabel")
+    speedLabel.Name = "SpeedLabel"
+    speedLabel.Size = UDim2.new(1, 0, 0, 25)
+    speedLabel.Position = UDim2.new(0, 0, 0, 100)
+    speedLabel.BackgroundTransparency = 1
+    speedLabel.Text = "Velocidade de Voo: " .. State.FlySpeed
+    speedLabel.TextColor3 = Color3.fromRGB(160, 160, 180)
+    speedLabel.TextSize = 12
+    speedLabel.Font = Enum.Font.Gotham
+    speedLabel.TextXAlignment = Enum.TextXAlignment.Left
+    speedLabel.Parent = content
+    GUI.SpeedLabel = speedLabel
+    
+    -- Botões de ajuste de velocidade
+    local speedDownBtn = Instance.new("TextButton")
+    speedDownBtn.Size = UDim2.new(0, 60, 0, 30)
+    speedDownBtn.Position = UDim2.new(0, 0, 0, 130)
+    speedDownBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 65)
+    speedDownBtn.Text = "-10"
+    speedDownBtn.TextColor3 = Color3.fromRGB(220, 220, 230)
+    speedDownBtn.TextSize = 14
+    speedDownBtn.Font = Enum.Font.Gotham
+    speedDownBtn.BorderSizePixel = 0
+    speedDownBtn.Parent = content
+    
+    local sdCorner = Instance.new("UICorner")
+    sdCorner.CornerRadius = UDim.new(0, 6)
+    sdCorner.Parent = speedDownBtn
+    
+    local speedUpBtn = Instance.new("TextButton")
+    speedUpBtn.Size = UDim2.new(0, 60, 0, 30)
+    speedUpBtn.Position = UDim2.new(0, 70, 0, 130)
+    speedUpBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 65)
+    speedUpBtn.Text = "+10"
+    speedUpBtn.TextColor3 = Color3.fromRGB(220, 220, 230)
+    speedUpBtn.TextSize = 14
+    speedUpBtn.Font = Enum.Font.Gotham
+    speedUpBtn.BorderSizePixel = 0
+    speedUpBtn.Parent = content
+    
+    local suCorner = Instance.new("UICorner")
+    suCorner.CornerRadius = UDim.new(0, 6)
+    suCorner.Parent = speedUpBtn
+    
+    -- Informação de atalho
+    local hintLabel = Instance.new("TextLabel")
+    hintLabel.Size = UDim2.new(1, 0, 0, 20)
+    hintLabel.Position = UDim2.new(0, 0, 0, 175)
+    hintLabel.BackgroundTransparency = 1
+    hintLabel.Text = "Pressione [K] para abrir/fechar"
+    hintLabel.TextColor3 = Color3.fromRGB(120, 120, 140)
+    hintLabel.TextSize = 11
+    hintLabel.Font = Enum.Font.Gotham
+    hintLabel.Parent = content
+    
+    -- ============================================
+    -- CONEXÕES DA GUI
+    -- ============================================
+    
+    -- Fechar
+    closeBtn.MouseButton1Click:Connect(function()
+        screenGui.Enabled = false
+    end)
+    
+    -- Minimizar
+    local minimized = false
+    minBtn.MouseButton1Cli
